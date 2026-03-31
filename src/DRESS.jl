@@ -8,7 +8,7 @@ Julia package for the DRESS algorithm.
 ```julia
 using DRESS
 
-result = dress_fit(4, [0,1,2,0], [1,2,3,3])
+result = fit(4, [0,1,2,0], [1,2,3,3])
 
 result.edge_dress          # per-edge similarity
 result.node_dress          # per-node aggregated similarity
@@ -20,8 +20,8 @@ module DRESS
 
 using Libdl
 
-export dress_fit, delta_dress_fit, nabla_dress_fit, DRESSResult, DeltaDRESSResult, NablaDRESSResult, HistogramEntry, DressGraph, UNDIRECTED, DIRECTED, FORWARD, BACKWARD
-export fit!, close!
+export fit, delta_fit, nabla_fit, DRESSResult, DeltaDRESSResult, NablaDRESSResult, HistogramEntry, DressGraph, UNDIRECTED, DIRECTED, FORWARD, BACKWARD
+export fit!, close!, delta_fit!, nabla_fit!
 
 # ── variant constants ────────────────────────────────────────────────
 const UNDIRECTED = Cint(0)
@@ -113,13 +113,13 @@ end
 function _ensure_lib()
     _LIB_HANDLE[] != C_NULL && return
     _LIB_HANDLE[] = _try_dlopen(_SO_NAME, _SO_PATH)
-    _FN_INIT[]    = dlsym(_LIB_HANDLE[], :init_dress_graph)
+    _FN_INIT[]    = dlsym(_LIB_HANDLE[], :dress_init_graph)
     _FN_FIT[]     = dlsym(_LIB_HANDLE[], :dress_fit)
-    _FN_FREE[]    = dlsym(_LIB_HANDLE[], :free_dress_graph)
+    _FN_FREE[]    = dlsym(_LIB_HANDLE[], :dress_free_graph)
     _FN_GET[]     = dlsym(_LIB_HANDLE[], :dress_get)
-    _FN_DELTA[]   = dlsym(_LIB_HANDLE[], :delta_dress_fit)
-    _FN_DELTA_STRIDED[] = dlsym(_LIB_HANDLE[], :delta_dress_fit_strided)
-    _FN_NABLA[]   = dlsym(_LIB_HANDLE[], :nabla_dress_fit)
+    _FN_DELTA[]   = dlsym(_LIB_HANDLE[], :dress_delta_fit)
+    _FN_DELTA_STRIDED[] = dlsym(_LIB_HANDLE[], :dress_delta_fit_strided)
+    _FN_NABLA[]   = dlsym(_LIB_HANDLE[], :dress_nabla_fit)
 end
 
 # ── result type ──────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ end
 """
     DRESSResult
 
-Holds the output of `dress_fit`.
+Holds the output of `fit`.
 
 Fields:
 - `sources::Vector{Int32}`      – edge source vertices
@@ -176,7 +176,7 @@ end
 # ── core wrapper ─────────────────────────────────────────────────────
 
 """
-    dress_fit(N, sources, targets;
+    fit(N, sources, targets;
               weights=nothing, node_weights=nothing,
               variant=UNDIRECTED,
               max_iterations=100, epsilon=1e-6,
@@ -197,7 +197,7 @@ Run the DRESS iterative fitting algorithm.
 - `epsilon::Float64`       – convergence threshold (default 1e-6)
 - `precompute_intercepts`  – pre-compute neighbour intercepts (faster but more memory)
 """
-function dress_fit(N::Integer,
+function fit(N::Integer,
                    sources::AbstractVector{<:Integer},
                    targets::AbstractVector{<:Integer};
                    weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
@@ -241,16 +241,16 @@ function dress_fit(N::Integer,
         nw_arr .= Cdouble.(node_weights)
     end
 
-    # init_dress_graph(N, E, U, V, W, NW, variant, precompute_intercepts) → ptr
+    # dress_init_graph(N, E, U, V, W, NW, variant, precompute_intercepts) → ptr
     g = ccall(_FN_INIT[], Ptr{Cvoid},
               (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
               Ptr{Cint}(U_c), Ptr{Cint}(V_c), Ptr{Cdouble}(W_c), Ptr{Cdouble}(NW_c),
               Cint(variant), Cint(precompute_intercepts))
 
-    g == C_NULL && error("init_dress_graph returned NULL")
+    g == C_NULL && error("dress_init_graph returned NULL")
 
-    # dress_fit(g, max_iterations, epsilon, &iterations, &delta)
+    # fit(g, max_iterations, epsilon, &iterations, &delta)
     iters_ref = Ref{Cint}(0)
     delta_ref = Ref{Cdouble}(0.0)
     ccall(_FN_FIT[], Cvoid,
@@ -376,7 +376,7 @@ function DressGraph(N::Integer,
               Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute_intercepts))
 
-    g == C_NULL && error("init_dress_graph returned NULL")
+    g == C_NULL && error("dress_init_graph returned NULL")
 
     obj = DressGraph(g, Int(N), E, Int32.(sources), Int32.(targets))
     finalizer(obj) do o
@@ -437,6 +437,119 @@ function result(g::DressGraph)
 end
 
 """
+    delta_fit!(g::DressGraph, k; max_iterations=100, epsilon=1e-6,
+              n_samples=0, seed=0,
+              keep_multisets=false, compute_histogram=true) → DeltaDRESSResult
+
+Δ^k-DRESS on a persistent graph.
+"""
+function delta_fit!(g::DressGraph, k::Integer;
+                    max_iterations::Integer=100,
+                    epsilon::Real=1e-6,
+                    n_samples::Integer=0,
+                    seed::Integer=0,
+                    keep_multisets::Bool=false,
+                    compute_histogram::Bool=true)
+    g.ptr == C_NULL && error("DressGraph already closed")
+    _ensure_lib()
+
+    hsize_ref = Ref{Cint}(0)
+    ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
+    nsub_ref  = Ref{Int64}(0)
+
+    h_ptr = ccall(_FN_DELTA_STRIDED[], Ptr{HistogramEntry},
+                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Cint, Cuint,
+                   Ptr{Cint}, Cint,
+                   Ptr{Ptr{Cdouble}}, Ptr{Int64}, Cint, Cint),
+                  g.ptr, Cint(k), Cint(max_iterations), Cdouble(epsilon),
+                  Cint(n_samples), Cuint(seed),
+                  compute_histogram ? hsize_ref : Ptr{Cint}(C_NULL),
+                  Cint(keep_multisets),
+                  keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
+                  nsub_ref,
+                  Cint(0), Cint(1))
+
+    hsize = Int(hsize_ref[])
+    histogram = _copy_histogram(h_ptr, hsize)
+
+    ms_mat = nothing
+    ns = Int(nsub_ref[])
+    E = g.e
+    if keep_multisets
+        ms_p = ms_ref[]
+        if ms_p != Ptr{Cdouble}(C_NULL) && ns > 0
+            flat = copy(unsafe_wrap(Array, ms_p, ns * E))
+            ms_mat = permutedims(reshape(flat, E, ns))
+            Libc.free(ms_p)
+        else
+            ms_mat = Matrix{Float64}(undef, 0, 0)
+        end
+    end
+
+    if h_ptr != C_NULL
+        Libc.free(h_ptr)
+    end
+
+    return DeltaDRESSResult(histogram, ms_mat, ns)
+end
+
+"""
+    nabla_fit!(g::DressGraph, k; max_iterations=100, epsilon=1e-6,
+              n_samples=0, seed=0,
+              keep_multisets=false, compute_histogram=true) → NablaDRESSResult
+
+∇^k-DRESS on a persistent graph.
+"""
+function nabla_fit!(g::DressGraph, k::Integer;
+                    max_iterations::Integer=100,
+                    epsilon::Real=1e-6,
+                    n_samples::Integer=0,
+                    seed::Integer=0,
+                    keep_multisets::Bool=false,
+                    compute_histogram::Bool=true)
+    g.ptr == C_NULL && error("DressGraph already closed")
+    _ensure_lib()
+
+    hsize_ref = Ref{Cint}(0)
+    ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
+    ntup_ref  = Ref{Int64}(0)
+
+    h_ptr = ccall(_FN_NABLA[], Ptr{HistogramEntry},
+                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Cint, Cuint,
+                   Ptr{Cint}, Cint,
+                   Ptr{Ptr{Cdouble}}, Ptr{Int64}),
+                  g.ptr, Cint(k), Cint(max_iterations), Cdouble(epsilon),
+                  Cint(n_samples), Cuint(seed),
+                  compute_histogram ? hsize_ref : Ptr{Cint}(C_NULL),
+                  Cint(keep_multisets),
+                  keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
+                  ntup_ref)
+
+    hsize = Int(hsize_ref[])
+    histogram = _copy_histogram(h_ptr, hsize)
+
+    ms_mat = nothing
+    ntup = Int(ntup_ref[])
+    E = g.e
+    if keep_multisets
+        ms_p = ms_ref[]
+        if ms_p != Ptr{Cdouble}(C_NULL) && ntup > 0
+            flat = copy(unsafe_wrap(Array, ms_p, ntup * E))
+            ms_mat = permutedims(reshape(flat, E, ntup))
+            Libc.free(ms_p)
+        else
+            ms_mat = Matrix{Float64}(undef, 0, 0)
+        end
+    end
+
+    if h_ptr != C_NULL
+        Libc.free(h_ptr)
+    end
+
+    return NablaDRESSResult(histogram, ms_mat, ntup)
+end
+
+"""
     close!(g::DressGraph)
 
 Explicitly free the underlying C graph.
@@ -459,7 +572,7 @@ end
 """
     DeltaDRESSResult
 
-Holds the output of `delta_dress_fit`.
+Holds the output of `delta_fit`.
 
 Fields:
 - `histogram::Vector{HistogramEntry}` – exact sparse histogram entries `(value, count)`
@@ -481,13 +594,12 @@ end
 # ── delta wrapper ────────────────────────────────────────────────────
 
 """
-    delta_dress_fit(N, sources, targets;
+    delta_fit(N, sources, targets;
                     weights=nothing, node_weights=nothing,
                     k=0, variant=UNDIRECTED,
                     max_iterations=100, epsilon=1e-6,
                     precompute=false,
-                    keep_multisets=false,
-                    offset=0, stride=1) → DeltaDRESSResult
+                    keep_multisets=false) → DeltaDRESSResult
 
 Run Δ^k-DRESS: enumerate all C(N,k) node-deletion subsets, fit DRESS on
 each subgraph, and return the pooled histogram.
@@ -507,10 +619,8 @@ each subgraph, and return the pooled histogram.
 - `precompute::Bool`     – precompute intercepts in subgraphs (default false)
 - `keep_multisets::Bool` – if true, return per-subgraph edge values in a
                            C(N,k) × E matrix (NaN = removed edge; default false)
-- `offset::Int`          – process only subgraphs where index % stride == offset (default 0)
-- `stride::Int`          – total number of strides (default 1 = process all)
 """
-function delta_dress_fit(N::Integer,
+function delta_fit(N::Integer,
                          sources::AbstractVector{<:Integer},
                          targets::AbstractVector{<:Integer};
                          weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
@@ -523,9 +633,7 @@ function delta_dress_fit(N::Integer,
                          seed::Integer      = 0,
                          precompute::Bool   = false,
                          keep_multisets::Bool = false,
-                         compute_histogram::Bool = true,
-                         offset::Integer    = 0,
-                         stride::Integer    = 1)
+                         compute_histogram::Bool = true)
 
     E = length(sources)
     length(targets) == E || throw(ArgumentError("sources and targets must have equal length"))
@@ -559,16 +667,16 @@ function delta_dress_fit(N::Integer,
         Ptr{Cdouble}(C_NULL)
     end
 
-    # init_dress_graph(N, E, U, V, W, NW, variant, precompute_intercepts) → ptr
+    # dress_init_graph(N, E, U, V, W, NW, variant, precompute_intercepts) → ptr
     g = ccall(_FN_INIT[], Ptr{Cvoid},
               (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
               Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute))
 
-    g == C_NULL && error("init_dress_graph returned NULL")
+    g == C_NULL && error("dress_init_graph returned NULL")
 
-    # delta_dress_fit_strided(g, k, iterations, epsilon, &hist_size, keep_multisets, &multisets, &num_subgraphs, offset, stride) → *dress_hist_pair_t
+    # dress_delta_fit_strided(g, k, iterations, epsilon, &hist_size, keep_multisets, &multisets, &num_subgraphs, offset, stride) → *dress_hist_pair_t
     hsize_ref = Ref{Cint}(0)
     ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
     nsub_ref  = Ref{Int64}(0)
@@ -580,7 +688,7 @@ function delta_dress_fit(N::Integer,
                   Cint(keep_multisets),
                   keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
                   nsub_ref,
-                  Cint(offset), Cint(stride))
+                  Cint(0), Cint(1))
 
     hsize = Int(hsize_ref[])
     histogram = _copy_histogram(h_ptr, hsize)
@@ -614,7 +722,7 @@ end
 """
     NablaDRESSResult
 
-Holds the output of `nabla_dress_fit`.
+Holds the output of `nabla_fit`.
 
 Fields:
 - `histogram::Vector{HistogramEntry}` – exact sparse histogram entries `(value, count)`
@@ -636,13 +744,13 @@ end
 # ── nabla wrapper ────────────────────────────────────────────────────────────
 
 """
-    nabla_dress_fit(N, sources, targets; k=0, ...) → NablaDRESSResult
+    nabla_fit(N, sources, targets; k=0, ...) → NablaDRESSResult
 
 Compute the ∇^k-DRESS histogram by enumerating all P(N,k) ordered k-tuples,
 marking each with generic injective node weights, and pooling the converged
 edge values.
 """
-function nabla_dress_fit(N::Integer,
+function nabla_fit(N::Integer,
                          sources::AbstractVector{<:Integer},
                          targets::AbstractVector{<:Integer};
                          weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
@@ -693,7 +801,7 @@ function nabla_dress_fit(N::Integer,
               Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute))
 
-    g == C_NULL && error("init_dress_graph returned NULL")
+    g == C_NULL && error("dress_init_graph returned NULL")
 
     hsize_ref = Ref{Cint}(0)
     ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
