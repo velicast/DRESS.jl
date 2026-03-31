@@ -14,7 +14,8 @@ module CUDA
 
 using Libdl
 
-using ...DRESS: DRESSResult, DeltaDRESSResult, UNDIRECTED, DIRECTED, FORWARD, BACKWARD
+using ...DRESS: DRESSResult, DeltaDRESSResult, HistogramEntry, UNDIRECTED, DIRECTED, FORWARD, BACKWARD, _copy_histogram
+import ...DRESS: dress_build as _cpu_build
 export delta_dress_fit, DeltaDRESSResult, UNDIRECTED, DIRECTED, FORWARD, BACKWARD
 
 # ── locate shared libraries ──────────────────────────────────────────
@@ -34,7 +35,7 @@ const _FN_MPI_CUDA_FCOMM = Ref{Ptr{Cvoid}}(C_NULL)
 function _try_dlopen(name::String, local_path::String; build::Bool=false)
     h = dlopen(name; throw_error=false)
     h !== nothing && return h
-    build && !isfile(local_path) && DRESS.dress_build()
+    build && !isfile(local_path) && _cpu_build()
     isfile(local_path) || error("Library $name not found. Install it or set LD_LIBRARY_PATH.")
     return dlopen(local_path)
 end
@@ -70,12 +71,16 @@ function delta_dress_fit(N::Integer,
                          sources::AbstractVector{<:Integer},
                          targets::AbstractVector{<:Integer};
                          weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
+                         node_weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
                          k::Integer         = 0,
                          variant::Integer   = UNDIRECTED,
                          max_iterations::Integer = 100,
                          epsilon::Real      = 1e-6,
+                         n_samples::Integer = 0,
+                         seed::Integer      = 0,
                          precompute::Bool   = false,
                          keep_multisets::Bool = false,
+                         compute_histogram::Bool = true,
                          comm               = nothing)
 
     if comm === nothing
@@ -105,10 +110,18 @@ function delta_dress_fit(N::Integer,
         Ptr{Cdouble}(C_NULL)
     end
 
+    NW_c = if node_weights !== nothing
+        nw_ptr = Libc.malloc(N * sizeof(Cdouble))
+        unsafe_wrap(Array, Ptr{Cdouble}(nw_ptr), N) .= Cdouble.(node_weights)
+        Ptr{Cdouble}(nw_ptr)
+    else
+        Ptr{Cdouble}(C_NULL)
+    end
+
     g = ccall(_FN_INIT[], Ptr{Cvoid},
-              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Cint, Cint),
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
-              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c,
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute))
 
     g == C_NULL && error("init_dress_graph returned NULL")
@@ -117,22 +130,19 @@ function delta_dress_fit(N::Integer,
     ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
     nsub_ref  = Ref{Int64}(0)
 
-    h_ptr = ccall(_FN_MPI_CUDA_FCOMM[], Ptr{Int64},
-                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Ptr{Cint}, Cint,
+    h_ptr = ccall(_FN_MPI_CUDA_FCOMM[], Ptr{HistogramEntry},
+                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Cint, Cuint, Ptr{Cint}, Cint,
                    Ptr{Ptr{Cdouble}}, Ptr{Int64}, Cint),
                   g, Cint(k), Cint(max_iterations), Cdouble(epsilon),
-                  hsize_ref,
+                  Cint(n_samples), Cuint(seed),
+                  compute_histogram ? hsize_ref : Ptr{Cint}(C_NULL),
                   Cint(keep_multisets),
                   keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
                   nsub_ref,
                   comm_f)
 
     hsize = Int(hsize_ref[])
-    histogram = if h_ptr != C_NULL && hsize > 0
-        copy(unsafe_wrap(Array, h_ptr, hsize))
-    else
-        Int64[]
-    end
+    histogram = _copy_histogram(h_ptr, hsize)
 
     ms_mat = nothing
     nsub = Int(nsub_ref[])
@@ -152,7 +162,7 @@ function delta_dress_fit(N::Integer,
     end
     ccall(_FN_FREE[], Cvoid, (Ptr{Cvoid},), g)
 
-    return DeltaDRESSResult(histogram, hsize, ms_mat, nsub)
+    return DeltaDRESSResult(histogram, ms_mat, nsub)
 end
 
 # ── persistent DressGraph (MPI + CUDA) ───────────────────────────────
@@ -268,7 +278,10 @@ MPI+CUDA distributed Δ^k-DRESS on a persistent graph.
 function delta_fit!(g::DressGraph, k::Integer;
                     max_iterations::Integer=100,
                     epsilon::Real=1e-6,
+                    n_samples::Integer=0,
+                    seed::Integer=0,
                     keep_multisets::Bool=false,
+                    compute_histogram::Bool=true,
                     comm=nothing)
     g.ptr == C_NULL && error("DressGraph already closed")
     _ensure_lib()
@@ -283,22 +296,19 @@ function delta_fit!(g::DressGraph, k::Integer;
     ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
     nsub_ref  = Ref{Int64}(0)
 
-    h_ptr = ccall(_FN_MPI_CUDA_FCOMM[], Ptr{Int64},
-                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Ptr{Cint}, Cint,
+    h_ptr = ccall(_FN_MPI_CUDA_FCOMM[], Ptr{HistogramEntry},
+                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Cint, Cuint, Ptr{Cint}, Cint,
                    Ptr{Ptr{Cdouble}}, Ptr{Int64}, Cint),
                   g.ptr, Cint(k), Cint(max_iterations), Cdouble(epsilon),
-                  hsize_ref,
+                  Cint(n_samples), Cuint(seed),
+                  compute_histogram ? hsize_ref : Ptr{Cint}(C_NULL),
                   Cint(keep_multisets),
                   keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
                   nsub_ref,
                   comm_f)
 
     hsize = Int(hsize_ref[])
-    histogram = if h_ptr != C_NULL && hsize > 0
-        copy(unsafe_wrap(Array, h_ptr, hsize))
-    else
-        Int64[]
-    end
+    histogram = _copy_histogram(h_ptr, hsize)
 
     ms_mat = nothing
     nsub = Int(nsub_ref[])
@@ -318,7 +328,7 @@ function delta_fit!(g::DressGraph, k::Integer;
         Libc.free(h_ptr)
     end
 
-    return DeltaDRESSResult(histogram, hsize, ms_mat, nsub)
+    return DeltaDRESSResult(histogram, ms_mat, nsub)
 end
 
 """

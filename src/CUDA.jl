@@ -20,7 +20,7 @@ module CUDA
 using Libdl
 
 # Re-export types and constants from the parent module.
-using ..DRESS: DRESSResult, DeltaDRESSResult, UNDIRECTED, DIRECTED, FORWARD, BACKWARD
+using ..DRESS: DRESSResult, DeltaDRESSResult, HistogramEntry, UNDIRECTED, DIRECTED, FORWARD, BACKWARD, _copy_histogram
 import ..DRESS: dress_build as _cpu_build
 export dress_fit, delta_dress_fit, DRESSResult, DeltaDRESSResult,
        UNDIRECTED, DIRECTED, FORWARD, BACKWARD
@@ -54,11 +54,12 @@ function dress_cuda_build()
     src       = joinpath(_LIB_DIR, "src", "dress.c")
     src_delta = joinpath(_LIB_DIR, "src", "delta_dress.c")
     src_impl  = joinpath(_LIB_DIR, "src", "delta_dress_impl.c")
+    src_hist  = joinpath(_LIB_DIR, "src", "dress_histogram.c")
     src_cuda  = joinpath(_LIB_DIR, "src", "cuda", "delta_dress_cuda.c")
     inc       = joinpath(_LIB_DIR, "include")
     src_dir   = joinpath(_LIB_DIR, "src")
 
-    for f in (src, src_delta, src_impl, src_cuda)
+    for f in (src, src_delta, src_impl, src_hist, src_cuda)
         isfile(f) || error("Cannot find $f")
     end
 
@@ -74,7 +75,7 @@ function dress_cuda_build()
     cc = get(ENV, "CC", "gcc")
     cmd = `$cc -shared -fPIC -O3 -fopenmp -DDRESS_CUDA -I$inc -I$src_dir
            -o $_CUDA_PATH
-           $src $src_delta $src_impl $src_cuda $_CUDA_OBJ
+            $src $src_delta $src_impl $src_hist $src_cuda $_CUDA_OBJ
            -lcudart_static -lm -ldl -lrt -lpthread`
     @info "Building DRESS CUDA shared library…" cmd
     run(cmd)
@@ -132,6 +133,7 @@ function dress_fit(N::Integer,
                    sources::AbstractVector{<:Integer},
                    targets::AbstractVector{<:Integer};
                    weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
+                   node_weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
                    variant::Integer   = UNDIRECTED,
                    max_iterations::Integer = 100,
                    epsilon::Real      = 1e-6,
@@ -141,6 +143,9 @@ function dress_fit(N::Integer,
     length(targets) == E || throw(ArgumentError("sources and targets must have equal length"))
     if weights !== nothing
         length(weights) == E || throw(ArgumentError("weights must have the same length as sources"))
+    end
+    if node_weights !== nothing
+        length(node_weights) == N || throw(ArgumentError("node_weights must have length N"))
     end
 
     _ensure_lib()
@@ -160,10 +165,17 @@ function dress_fit(N::Integer,
         w_arr .= Cdouble.(weights)
     end
 
+    NW_c = C_NULL
+    if node_weights !== nothing
+        NW_c = Libc.malloc(N * sizeof(Cdouble))
+        nw_arr = unsafe_wrap(Array, Ptr{Cdouble}(NW_c), N)
+        nw_arr .= Cdouble.(node_weights)
+    end
+
     g = ccall(_FN_INIT[], Ptr{Cvoid},
-              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Cint, Cint),
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
-              Ptr{Cint}(U_c), Ptr{Cint}(V_c), Ptr{Cdouble}(W_c),
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), Ptr{Cdouble}(W_c), Ptr{Cdouble}(NW_c),
               Cint(variant), Cint(precompute_intercepts))
 
     g == C_NULL && error("init_dress_graph returned NULL")
@@ -179,6 +191,7 @@ function dress_fit(N::Integer,
     edge_weight_ptr = unsafe_load(Ptr{Ptr{Cdouble}}(g + 72))
     edge_dress_ptr  = unsafe_load(Ptr{Ptr{Cdouble}}(g + 80))
     node_dress_ptr  = unsafe_load(Ptr{Ptr{Cdouble}}(g + 96))
+    nw_ptr          = unsafe_load(Ptr{Ptr{Cdouble}}(g + 104))
 
     ew = copy(unsafe_wrap(Array, edge_weight_ptr, E))
     ed = copy(unsafe_wrap(Array, edge_dress_ptr,  E))
@@ -186,10 +199,15 @@ function dress_fit(N::Integer,
     src_out = copy(unsafe_wrap(Array, Ptr{Cint}(U_c), E))
     tgt_out = copy(unsafe_wrap(Array, Ptr{Cint}(V_c), E))
 
+    nw_out = nothing
+    if nw_ptr != C_NULL
+        nw_out = copy(unsafe_wrap(Array, nw_ptr, Cint(N)))
+    end
+
     ccall(_FN_FREE[], Cvoid, (Ptr{Cvoid},), g)
 
     return DRESSResult(src_out, tgt_out, ew, ed, nd,
-                       Int(iters_ref[]), Float64(delta_ref[]))
+                       Int(iters_ref[]), Float64(delta_ref[]), nw_out)
 end
 
 # ── delta_dress_fit (CUDA) ───────────────────────────────────────────
@@ -203,12 +221,16 @@ function delta_dress_fit(N::Integer,
                          sources::AbstractVector{<:Integer},
                          targets::AbstractVector{<:Integer};
                          weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
+                         node_weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
                          k::Integer         = 0,
                          variant::Integer   = UNDIRECTED,
                          max_iterations::Integer = 100,
                          epsilon::Real      = 1e-6,
+                         n_samples::Integer = 0,
+                         seed::Integer      = 0,
                          precompute::Bool   = false,
                          keep_multisets::Bool = false,
+                         compute_histogram::Bool = true,
                          offset::Integer    = 0,
                          stride::Integer    = 1)
 
@@ -234,10 +256,18 @@ function delta_dress_fit(N::Integer,
         Ptr{Cdouble}(C_NULL)
     end
 
+    NW_c = if node_weights !== nothing
+        nw_ptr = Libc.malloc(N * sizeof(Cdouble))
+        unsafe_wrap(Array, Ptr{Cdouble}(nw_ptr), N) .= Cdouble.(node_weights)
+        Ptr{Cdouble}(nw_ptr)
+    else
+        Ptr{Cdouble}(C_NULL)
+    end
+
     g = ccall(_FN_INIT[], Ptr{Cvoid},
-              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Cint, Cint),
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
-              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c,
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute))
 
     g == C_NULL && error("init_dress_graph returned NULL")
@@ -245,21 +275,18 @@ function delta_dress_fit(N::Integer,
     hsize_ref = Ref{Cint}(0)
     ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
     nsub_ref  = Ref{Int64}(0)
-    h_ptr = ccall(_FN_DELTA_STRIDED[], Ptr{Int64},
-                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Ptr{Cint}, Cint, Ptr{Ptr{Cdouble}}, Ptr{Int64}, Cint, Cint),
+    h_ptr = ccall(_FN_DELTA_STRIDED[], Ptr{HistogramEntry},
+                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Cint, Cuint, Ptr{Cint}, Cint, Ptr{Ptr{Cdouble}}, Ptr{Int64}, Cint, Cint),
                   g, Cint(k), Cint(max_iterations), Cdouble(epsilon),
-                  hsize_ref,
+                  Cint(n_samples), Cuint(seed),
+                  compute_histogram ? hsize_ref : Ptr{Cint}(C_NULL),
                   Cint(keep_multisets),
                   keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
                   nsub_ref,
                   Cint(offset), Cint(stride))
 
     hsize = Int(hsize_ref[])
-    histogram = if h_ptr != C_NULL && hsize > 0
-        copy(unsafe_wrap(Array, h_ptr, hsize))
-    else
-        Int64[]
-    end
+    histogram = _copy_histogram(h_ptr, hsize)
 
     ms_mat = nothing
     nsub = Int(nsub_ref[])
@@ -279,7 +306,7 @@ function delta_dress_fit(N::Integer,
     end
     ccall(_FN_FREE[], Cvoid, (Ptr{Cvoid},), g)
 
-    return DeltaDRESSResult(histogram, hsize, ms_mat, nsub)
+    return DeltaDRESSResult(histogram, ms_mat, nsub)
 end
 
 # ── persistent DressGraph (CUDA) ─────────────────────────────────────
@@ -309,7 +336,7 @@ end
 export DressGraph, fit!, close!
 
 """
-    DressGraph(N, sources, targets; weights=nothing,
+    DressGraph(N, sources, targets; weights=nothing, node_weights=nothing,
                variant=UNDIRECTED, precompute_intercepts=false)
 
 Create a persistent CUDA DRESS graph object.
@@ -318,6 +345,7 @@ function DressGraph(N::Integer,
                     sources::AbstractVector{<:Integer},
                     targets::AbstractVector{<:Integer};
                     weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
+                    node_weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
                     variant::Integer   = UNDIRECTED,
                     precompute_intercepts::Bool = false)
 
@@ -325,6 +353,9 @@ function DressGraph(N::Integer,
     length(targets) == E || throw(ArgumentError("sources/targets length mismatch"))
     if weights !== nothing
         length(weights) == E || throw(ArgumentError("weights length mismatch"))
+    end
+    if node_weights !== nothing
+        length(node_weights) == N || throw(ArgumentError("node_weights length mismatch"))
     end
 
     _ensure_lib()
@@ -342,10 +373,18 @@ function DressGraph(N::Integer,
         Ptr{Cdouble}(C_NULL)
     end
 
+    NW_c = if node_weights !== nothing
+        nw_ptr = Libc.malloc(N * sizeof(Cdouble))
+        unsafe_wrap(Array, Ptr{Cdouble}(nw_ptr), N) .= Cdouble.(node_weights)
+        Ptr{Cdouble}(nw_ptr)
+    else
+        Ptr{Cdouble}(C_NULL)
+    end
+
     g = ccall(_FN_INIT[], Ptr{Cvoid},
-              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Cint, Cint),
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
-              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c,
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute_intercepts))
 
     g == C_NULL && error("init_dress_graph returned NULL")
@@ -409,7 +448,14 @@ function result(g::DressGraph)
     ew = copy(unsafe_wrap(Array, unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 72)), g.e))
     ed = copy(unsafe_wrap(Array, unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 80)), g.e))
     nd = copy(unsafe_wrap(Array, unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 96)), g.n))
-    DRESSResult(copy(g.sources), copy(g.targets), ew, ed, nd, 0, 0.0)
+
+    nw_ptr = unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 104))
+    nw = nothing
+    if nw_ptr != C_NULL
+        nw = copy(unsafe_wrap(Array, nw_ptr, g.n))
+    end
+
+    DRESSResult(copy(g.sources), copy(g.targets), ew, ed, nd, 0, 0.0, nw)
 end
 
 export result

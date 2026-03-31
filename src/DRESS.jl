@@ -20,7 +20,7 @@ module DRESS
 
 using Libdl
 
-export dress_fit, delta_dress_fit, DRESSResult, DeltaDRESSResult, DressGraph, UNDIRECTED, DIRECTED, FORWARD, BACKWARD
+export dress_fit, delta_dress_fit, nabla_dress_fit, DRESSResult, DeltaDRESSResult, NablaDRESSResult, HistogramEntry, DressGraph, UNDIRECTED, DIRECTED, FORWARD, BACKWARD
 export fit!, close!
 
 # ── variant constants ────────────────────────────────────────────────
@@ -68,10 +68,25 @@ function dress_build()
     src_dir, inc_dir = _find_sources()
     src = joinpath(src_dir, "dress.c")
     src_delta = joinpath(src_dir, "delta_dress.c")
+    src_impl = joinpath(src_dir, "delta_dress_impl.c")
+    src_nabla = joinpath(src_dir, "nabla_dress.c")
+    src_nabla_impl = joinpath(src_dir, "nabla_dress_impl.c")
+    src_hist = joinpath(src_dir, "dress_histogram.c")
+    src_omp = joinpath(src_dir, "omp", "dress_omp.c")
+    src_omp_delta = joinpath(src_dir, "omp", "delta_dress_omp.c")
+    src_omp_nabla = joinpath(src_dir, "omp", "nabla_dress_omp.c")
     isfile(src) || error("Cannot find dress.c at $src")
     isfile(src_delta) || error("Cannot find delta_dress.c at $src_delta")
+    isfile(src_impl) || error("Cannot find delta_dress_impl.c at $src_impl")
+    isfile(src_nabla) || error("Cannot find nabla_dress.c at $src_nabla")
+    isfile(src_nabla_impl) || error("Cannot find nabla_dress_impl.c at $src_nabla_impl")
+    isfile(src_hist) || error("Cannot find dress_histogram.c at $src_hist")
     cc = get(ENV, "CC", "gcc")
-    cmd = `$cc -shared -fPIC -O3 -fopenmp -I$inc_dir -o $_SO_PATH $src $src_delta -lm`
+    omp_srcs = String[]
+    if isfile(src_omp) && isfile(src_omp_delta) && isfile(src_omp_nabla)
+        push!(omp_srcs, src_omp, src_omp_delta, src_omp_nabla)
+    end
+    cmd = `$cc -shared -fPIC -O3 -fopenmp -I$inc_dir -o $_SO_PATH $src $src_delta $src_impl $src_nabla $src_nabla_impl $src_hist $omp_srcs -lm`
     @info "Building DRESS shared library…" cmd
     run(cmd)
     @info "Built $_SO_PATH"
@@ -86,6 +101,7 @@ const _FN_FREE    = Ref{Ptr{Cvoid}}(C_NULL)
 const _FN_GET     = Ref{Ptr{Cvoid}}(C_NULL)
 const _FN_DELTA   = Ref{Ptr{Cvoid}}(C_NULL)
 const _FN_DELTA_STRIDED = Ref{Ptr{Cvoid}}(C_NULL)
+const _FN_NABLA   = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _try_dlopen(name::String, local_path::String)
     h = dlopen(name; throw_error=false)
@@ -103,6 +119,7 @@ function _ensure_lib()
     _FN_GET[]     = dlsym(_LIB_HANDLE[], :dress_get)
     _FN_DELTA[]   = dlsym(_LIB_HANDLE[], :delta_dress_fit)
     _FN_DELTA_STRIDED[] = dlsym(_LIB_HANDLE[], :delta_dress_fit_strided)
+    _FN_NABLA[]   = dlsym(_LIB_HANDLE[], :nabla_dress_fit)
 end
 
 # ── result type ──────────────────────────────────────────────────────
@@ -129,6 +146,26 @@ struct DRESSResult
     node_dress  :: Vector{Float64}
     iterations  :: Int
     delta       :: Float64
+    node_weights :: Union{Vector{Float64}, Nothing}
+end
+
+struct HistogramEntry
+    value :: Float64
+    count :: Int64
+end
+
+Base.:(==)(a::HistogramEntry, b::HistogramEntry) =
+    a.value == b.value && a.count == b.count
+
+function Base.show(io::IO, entry::HistogramEntry)
+    print(io, "HistogramEntry(value=$(entry.value), count=$(entry.count))")
+end
+
+function _copy_histogram(h_ptr::Ptr{HistogramEntry}, hsize::Integer)
+    if h_ptr == C_NULL || hsize <= 0
+        return HistogramEntry[]
+    end
+    copy(unsafe_wrap(Array, h_ptr, Int(hsize)))
 end
 
 function Base.show(io::IO, r::DRESSResult)
@@ -140,7 +177,8 @@ end
 
 """
     dress_fit(N, sources, targets;
-              weights=nothing, variant=UNDIRECTED,
+              weights=nothing, node_weights=nothing,
+              variant=UNDIRECTED,
               max_iterations=100, epsilon=1e-6,
               precompute_intercepts=false) → DRESSResult
 
@@ -153,6 +191,7 @@ Run the DRESS iterative fitting algorithm.
 
 # Keyword arguments
 - `weights`                – optional edge weights (Float64 vector, same length as sources)
+- `node_weights`           – optional node weights (Float64 vector, length N)
 - `variant`                – one of `UNDIRECTED`, `DIRECTED`, `FORWARD`, `BACKWARD`
 - `max_iterations::Int`    – maximum fitting iterations (default 100)
 - `epsilon::Float64`       – convergence threshold (default 1e-6)
@@ -162,6 +201,7 @@ function dress_fit(N::Integer,
                    sources::AbstractVector{<:Integer},
                    targets::AbstractVector{<:Integer};
                    weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
+                   node_weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
                    variant::Integer   = UNDIRECTED,
                    max_iterations::Integer = 100,
                    epsilon::Real      = 1e-6,
@@ -172,10 +212,13 @@ function dress_fit(N::Integer,
     if weights !== nothing
         length(weights) == E || throw(ArgumentError("weights must have the same length as sources"))
     end
+    if node_weights !== nothing
+        length(node_weights) == N || throw(ArgumentError("node_weights must have length N"))
+    end
 
     _ensure_lib()
 
-    # The C library takes ownership of U, V, W. We must pass malloc'd copies.
+    # The C library takes ownership of U, V, W, NW. We must pass malloc'd copies.
     U_c = Libc.malloc(E * sizeof(Cint))
     V_c = Libc.malloc(E * sizeof(Cint))
 
@@ -191,11 +234,18 @@ function dress_fit(N::Integer,
         w_arr .= Cdouble.(weights)
     end
 
-    # init_dress_graph(N, E, U, V, W, variant, precompute_intercepts) → ptr
+    NW_c = C_NULL
+    if node_weights !== nothing
+        NW_c = Libc.malloc(N * sizeof(Cdouble))
+        nw_arr = unsafe_wrap(Array, Ptr{Cdouble}(NW_c), N)
+        nw_arr .= Cdouble.(node_weights)
+    end
+
+    # init_dress_graph(N, E, U, V, W, NW, variant, precompute_intercepts) → ptr
     g = ccall(_FN_INIT[], Ptr{Cvoid},
-              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Cint, Cint),
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
-              Ptr{Cint}(U_c), Ptr{Cint}(V_c), Ptr{Cdouble}(W_c),
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), Ptr{Cdouble}(W_c), Ptr{Cdouble}(NW_c),
               Cint(variant), Cint(precompute_intercepts))
 
     g == C_NULL && error("init_dress_graph returned NULL")
@@ -226,10 +276,12 @@ function dress_fit(N::Integer,
     #   double *edge_dress;        // Ptr    offset 80
     #   double *edge_dress_next;   // Ptr    offset 88
     #   double *node_dress;        // Ptr    offset 96
+    #   double *NW;                // Ptr    offset 104
 
     edge_weight_ptr = unsafe_load(Ptr{Ptr{Cdouble}}(g + 72))
     edge_dress_ptr  = unsafe_load(Ptr{Ptr{Cdouble}}(g + 80))
     node_dress_ptr  = unsafe_load(Ptr{Ptr{Cdouble}}(g + 96))
+    nw_ptr          = unsafe_load(Ptr{Ptr{Cdouble}}(g + 104))
 
     # Copy results into Julia-owned arrays before freeing the C struct
     ew = copy(unsafe_wrap(Array, edge_weight_ptr, E))
@@ -238,11 +290,16 @@ function dress_fit(N::Integer,
     src_out = copy(unsafe_wrap(Array, Ptr{Cint}(U_c), E))
     tgt_out = copy(unsafe_wrap(Array, Ptr{Cint}(V_c), E))
 
+    nw_out = nothing
+    if nw_ptr != C_NULL
+        nw_out = copy(unsafe_wrap(Array, nw_ptr, Cint(N)))
+    end
+
     # Free
     ccall(_FN_FREE[], Cvoid, (Ptr{Cvoid},), g)
 
     return DRESSResult(src_out, tgt_out, ew, ed, nd,
-                       Int(iters_ref[]), Float64(delta_ref[]))
+                       Int(iters_ref[]), Float64(delta_ref[]), nw_out)
 end
 
 # ── persistent DressGraph object ─────────────────────────────────────
@@ -268,7 +325,7 @@ mutable struct DressGraph
 end
 
 """
-    DressGraph(N, sources, targets; weights=nothing,
+    DressGraph(N, sources, targets; weights=nothing, node_weights=nothing,
                variant=UNDIRECTED, precompute_intercepts=false)
 
 Create a persistent DRESS graph object.
@@ -277,6 +334,7 @@ function DressGraph(N::Integer,
                     sources::AbstractVector{<:Integer},
                     targets::AbstractVector{<:Integer};
                     weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
+                    node_weights::Union{Nothing, AbstractVector{<:Real}} = nothing,
                     variant::Integer   = UNDIRECTED,
                     precompute_intercepts::Bool = false)
 
@@ -284,6 +342,9 @@ function DressGraph(N::Integer,
     length(targets) == E || throw(ArgumentError("sources/targets length mismatch"))
     if weights !== nothing
         length(weights) == E || throw(ArgumentError("weights length mismatch"))
+    end
+    if node_weights !== nothing
+        length(node_weights) == N || throw(ArgumentError("node_weights length mismatch"))
     end
 
     _ensure_lib()
@@ -301,10 +362,18 @@ function DressGraph(N::Integer,
         Ptr{Cdouble}(C_NULL)
     end
 
+    NW_c = if node_weights !== nothing
+        nw_ptr = Libc.malloc(N * sizeof(Cdouble))
+        unsafe_wrap(Array, Ptr{Cdouble}(nw_ptr), N) .= Cdouble.(node_weights)
+        Ptr{Cdouble}(nw_ptr)
+    else
+        Ptr{Cdouble}(C_NULL)
+    end
+
     g = ccall(_FN_INIT[], Ptr{Cvoid},
-              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Cint, Cint),
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
-              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c,
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute_intercepts))
 
     g == C_NULL && error("init_dress_graph returned NULL")
@@ -357,7 +426,14 @@ function result(g::DressGraph)
     ew = copy(unsafe_wrap(Array, unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 72)), g.e))
     ed = copy(unsafe_wrap(Array, unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 80)), g.e))
     nd = copy(unsafe_wrap(Array, unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 96)), g.n))
-    DRESSResult(copy(g.sources), copy(g.targets), ew, ed, nd, 0, 0.0)
+    
+    nw_ptr = unsafe_load(Ptr{Ptr{Cdouble}}(g.ptr + 104))
+    nw = nothing
+    if nw_ptr != C_NULL
+        nw = copy(unsafe_wrap(Array, nw_ptr, g.n))
+    end
+
+    DRESSResult(copy(g.sources), copy(g.targets), ew, ed, nd, 0, 0.0, nw)
 end
 
 """
@@ -386,28 +462,27 @@ end
 Holds the output of `delta_dress_fit`.
 
 Fields:
-- `histogram::Vector{Int64}`          – bin-count vector
-- `hist_size::Int`                    – number of bins (floor(dmax/ε) + 1; dmax = 2 unweighted)
+- `histogram::Vector{HistogramEntry}` – exact sparse histogram entries `(value, count)`
 - `multisets::Union{Matrix{Float64}, Nothing}` – C(N,k) × E matrix of per-subgraph
   edge values (NaN = removed edge); `nothing` when `keep_multisets=false`
 - `num_subgraphs::Int`                – C(N,k)
 """
 struct DeltaDRESSResult
-    histogram :: Vector{Int64}
-    hist_size :: Int
+    histogram :: Vector{HistogramEntry}
     multisets :: Union{Matrix{Float64}, Nothing}
     num_subgraphs :: Int
 end
 
 function Base.show(io::IO, r::DeltaDRESSResult)
-    total = sum(r.histogram)
-    print(io, "DeltaDRESSResult(hist_size=$(r.hist_size), total_values=$total)")
+    total = sum((entry.count for entry in r.histogram); init=Int64(0))
+    print(io, "DeltaDRESSResult(histogram_entries=$(length(r.histogram)), total_values=$total)")
 end
 
 # ── delta wrapper ────────────────────────────────────────────────────
 
 """
     delta_dress_fit(N, sources, targets;
+                    weights=nothing, node_weights=nothing,
                     k=0, variant=UNDIRECTED,
                     max_iterations=100, epsilon=1e-6,
                     precompute=false,
@@ -423,6 +498,8 @@ each subgraph, and return the pooled histogram.
 - `targets::Vector{Int}`  – edge target vertices (0-based)
 
 # Keyword arguments
+- `weights`              – optional edge weights (Float64 vector, same length as sources)
+- `node_weights`         – optional node weights (Float64 vector, length N)
 - `k::Int`               – deletion depth (default 0 = original graph)
 - `variant`              – one of `UNDIRECTED`, `DIRECTED`, `FORWARD`, `BACKWARD`
 - `max_iterations::Int`  – max DRESS iterations per subgraph (default 100)
@@ -437,12 +514,16 @@ function delta_dress_fit(N::Integer,
                          sources::AbstractVector{<:Integer},
                          targets::AbstractVector{<:Integer};
                          weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
+                         node_weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
                          k::Integer         = 0,
                          variant::Integer   = UNDIRECTED,
                          max_iterations::Integer = 100,
                          epsilon::Real      = 1e-6,
+                         n_samples::Integer = 0,
+                         seed::Integer      = 0,
                          precompute::Bool   = false,
                          keep_multisets::Bool = false,
+                         compute_histogram::Bool = true,
                          offset::Integer    = 0,
                          stride::Integer    = 1)
 
@@ -469,34 +550,40 @@ function delta_dress_fit(N::Integer,
         Ptr{Cdouble}(C_NULL)
     end
 
-    # init_dress_graph(N, E, U, V, W, variant, precompute_intercepts) → ptr
+    NW_c = if node_weights !== nothing
+        nw_ptr = Libc.malloc(N * sizeof(Cdouble))
+        nw_arr = unsafe_wrap(Array, Ptr{Cdouble}(nw_ptr), N)
+        nw_arr .= Cdouble.(node_weights)
+        Ptr{Cdouble}(nw_ptr)
+    else
+        Ptr{Cdouble}(C_NULL)
+    end
+
+    # init_dress_graph(N, E, U, V, W, NW, variant, precompute_intercepts) → ptr
     g = ccall(_FN_INIT[], Ptr{Cvoid},
-              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Cint, Cint),
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
               Cint(N), Cint(E),
-              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c,
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
               Cint(variant), Cint(precompute))
 
     g == C_NULL && error("init_dress_graph returned NULL")
 
-    # delta_dress_fit_strided(g, k, iterations, epsilon, &hist_size, keep_multisets, &multisets, &num_subgraphs, offset, stride) → *int64
+    # delta_dress_fit_strided(g, k, iterations, epsilon, &hist_size, keep_multisets, &multisets, &num_subgraphs, offset, stride) → *dress_hist_pair_t
     hsize_ref = Ref{Cint}(0)
     ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
     nsub_ref  = Ref{Int64}(0)
-    h_ptr = ccall(_FN_DELTA_STRIDED[], Ptr{Int64},
-                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Ptr{Cint}, Cint, Ptr{Ptr{Cdouble}}, Ptr{Int64}, Cint, Cint),
+    h_ptr = ccall(_FN_DELTA_STRIDED[], Ptr{HistogramEntry},
+                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Cint, Cuint, Ptr{Cint}, Cint, Ptr{Ptr{Cdouble}}, Ptr{Int64}, Cint, Cint),
                   g, Cint(k), Cint(max_iterations), Cdouble(epsilon),
-                  hsize_ref,
+                  Cint(n_samples), Cuint(seed),
+                  compute_histogram ? hsize_ref : Ptr{Cint}(C_NULL),
                   Cint(keep_multisets),
                   keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
                   nsub_ref,
                   Cint(offset), Cint(stride))
 
     hsize = Int(hsize_ref[])
-    histogram = if h_ptr != C_NULL && hsize > 0
-        copy(unsafe_wrap(Array, h_ptr, hsize))
-    else
-        Int64[]
-    end
+    histogram = _copy_histogram(h_ptr, hsize)
 
     # Extract multisets if requested
     ms_mat = nothing
@@ -520,12 +607,136 @@ function delta_dress_fit(N::Integer,
     end
     ccall(_FN_FREE[], Cvoid, (Ptr{Cvoid},), g)
 
-    return DeltaDRESSResult(histogram, hsize, ms_mat, nsub)
+    return DeltaDRESSResult(histogram, ms_mat, nsub)
+end
+# ── nabla result type ────────────────────────────────────────────────────────
+
+"""
+    NablaDRESSResult
+
+Holds the output of `nabla_dress_fit`.
+
+Fields:
+- `histogram::Vector{HistogramEntry}` – exact sparse histogram entries `(value, count)`
+- `multisets::Union{Matrix{Float64}, Nothing}` – P(N,k) × E matrix of per-tuple
+  edge values; `nothing` when `keep_multisets=false`
+- `num_tuples::Int`                   – P(N,k)
+"""
+struct NablaDRESSResult
+    histogram :: Vector{HistogramEntry}
+    multisets :: Union{Matrix{Float64}, Nothing}
+    num_tuples :: Int
 end
 
+function Base.show(io::IO, r::NablaDRESSResult)
+    total = sum((entry.count for entry in r.histogram); init=Int64(0))
+    print(io, "NablaDRESSResult(histogram_entries=$(length(r.histogram)), total_values=$total)")
+end
+
+# ── nabla wrapper ────────────────────────────────────────────────────────────
+
+"""
+    nabla_dress_fit(N, sources, targets; k=0, ...) → NablaDRESSResult
+
+Compute the ∇^k-DRESS histogram by enumerating all P(N,k) ordered k-tuples,
+marking each with generic injective node weights, and pooling the converged
+edge values.
+"""
+function nabla_dress_fit(N::Integer,
+                         sources::AbstractVector{<:Integer},
+                         targets::AbstractVector{<:Integer};
+                         weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
+                         node_weights::Union{AbstractVector{<:Real}, Nothing} = nothing,
+                         k::Integer         = 0,
+                         variant::Integer   = UNDIRECTED,
+                         max_iterations::Integer = 100,
+                         epsilon::Real      = 1e-6,
+                         n_samples::Integer = 0,
+                         seed::Integer      = 0,
+                         precompute::Bool   = false,
+                         keep_multisets::Bool = false,
+                         compute_histogram::Bool = true)
+
+    E = length(sources)
+    length(targets) == E || throw(ArgumentError("sources and targets must have equal length"))
+
+    _ensure_lib()
+
+    U_c = Libc.malloc(E * sizeof(Cint))
+    V_c = Libc.malloc(E * sizeof(Cint))
+    u_arr = unsafe_wrap(Array, Ptr{Cint}(U_c), E)
+    v_arr = unsafe_wrap(Array, Ptr{Cint}(V_c), E)
+    u_arr .= Cint.(sources)
+    v_arr .= Cint.(targets)
+
+    W_c = if weights !== nothing
+        w_ptr = Libc.malloc(E * sizeof(Cdouble))
+        w_arr = unsafe_wrap(Array, Ptr{Cdouble}(w_ptr), E)
+        w_arr .= Cdouble.(weights)
+        Ptr{Cdouble}(w_ptr)
+    else
+        Ptr{Cdouble}(C_NULL)
+    end
+
+    NW_c = if node_weights !== nothing
+        nw_ptr = Libc.malloc(N * sizeof(Cdouble))
+        nw_arr = unsafe_wrap(Array, Ptr{Cdouble}(nw_ptr), N)
+        nw_arr .= Cdouble.(node_weights)
+        Ptr{Cdouble}(nw_ptr)
+    else
+        Ptr{Cdouble}(C_NULL)
+    end
+
+    g = ccall(_FN_INIT[], Ptr{Cvoid},
+              (Cint, Cint, Ptr{Cint}, Ptr{Cint}, Ptr{Cdouble}, Ptr{Cdouble}, Cint, Cint),
+              Cint(N), Cint(E),
+              Ptr{Cint}(U_c), Ptr{Cint}(V_c), W_c, NW_c,
+              Cint(variant), Cint(precompute))
+
+    g == C_NULL && error("init_dress_graph returned NULL")
+
+    hsize_ref = Ref{Cint}(0)
+    ms_ref    = Ref{Ptr{Cdouble}}(Ptr{Cdouble}(C_NULL))
+    ntup_ref  = Ref{Int64}(0)
+    h_ptr = ccall(_FN_NABLA[], Ptr{HistogramEntry},
+                  (Ptr{Cvoid}, Cint, Cint, Cdouble, Cint, Cuint, Ptr{Cint}, Cint, Ptr{Ptr{Cdouble}}, Ptr{Int64}),
+                  g, Cint(k), Cint(max_iterations), Cdouble(epsilon),
+                  Cint(n_samples), Cuint(seed),
+                  compute_histogram ? hsize_ref : Ptr{Cint}(C_NULL),
+                  Cint(keep_multisets),
+                  keep_multisets ? ms_ref : Ptr{Ptr{Cdouble}}(C_NULL),
+                  ntup_ref)
+
+    hsize = Int(hsize_ref[])
+    histogram = _copy_histogram(h_ptr, hsize)
+
+    ms_mat = nothing
+    ntup = Int(ntup_ref[])
+    if keep_multisets
+        ms_p = ms_ref[]
+        if ms_p != Ptr{Cdouble}(C_NULL) && ntup > 0
+            flat = copy(unsafe_wrap(Array, ms_p, ntup * E))
+            ms_mat = permutedims(reshape(flat, E, ntup))
+            Libc.free(ms_p)
+        else
+            ms_mat = Matrix{Float64}(undef, 0, 0)
+        end
+    end
+
+    if h_ptr != C_NULL
+        Libc.free(h_ptr)
+    end
+    ccall(_FN_FREE[], Cvoid, (Ptr{Cvoid},), g)
+
+    return NablaDRESSResult(histogram, ms_mat, ntup)
+end
 # ── CUDA submodule ───────────────────────────────────────────────────
 
 include("CUDA.jl")
+
+# ── OMP submodule ────────────────────────────────────────────────────
+
+include("OMP.jl")
 
 # ── MPI submodule ────────────────────────────────────────────────────
 
